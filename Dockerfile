@@ -65,6 +65,6 @@ ENV OPENAB_AGENT_COMMAND="kiro-cli acp --trust-all-tools"
 ENV OPENAB_AGENT_AUTH_COMMAND="kiro-cli login --use-device-flow"
 
 ENTRYPOINT ["tini", "--"]
-RUN mkdir -p /etc/openab
-COPY config.toml /etc/openab/config.toml
-CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
+RUN mkdir -p /home/agent/openab
+COPY config.toml /home/agent/openab/config.toml
+CMD ["openab", "run", "-c", "/home/agent/openab/config.toml"]
