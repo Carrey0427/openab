@@ -4,7 +4,7 @@
 bot_token = "${DISCORD_BOT_TOKEN}"
 # allow_all_channels = true            # true = allow all channels; false = only allowed_channels
 #                                      # omitted = auto-detect from list (non-empty → false, empty → true)
-allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-detected as false
+allowed_channels = ["1511191529488912545"]       # ↑ omitted + non-empty list → auto-detected as false
 # allow_all_users = true               # true = any user; false = only allowed_users
 #                                      # omitted = auto-detect from list (non-empty → false, empty → true)
 # allowed_users = ["<YOUR_DISCORD_USER_ID>"]  # ↑ omitted + empty/absent list → auto-detected as true
