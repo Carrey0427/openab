@@ -7,7 +7,7 @@ bot_token = "${DISCORD_BOT_TOKEN}"
 allowed_channels = ["1511191529488912545"]       # ↑ omitted + non-empty list → auto-detected as false
 # allow_all_users = true               # true = any user; false = only allowed_users
 #                                      # omitted = auto-detect from list (non-empty → false, empty → true)
-# allowed_users = ["<YOUR_DISCORD_USER_ID>"]  # ↑ omitted + empty/absent list → auto-detected as true
+# allowed_users = ["795923633095704596"]  # ↑ omitted + empty/absent list → auto-detected as true
 # allow_bot_messages = "off"  # "off" (default) | "mentions" | "all"
                                # "mentions" is recommended for multi-agent collaboration
 # trusted_bot_ids = []         # empty = any bot (mode permitting); set to restrict
