@@ -6,6 +6,7 @@ mod ctl;
     feature = "googlechat",
     feature = "wecom",
     feature = "teams",
+    feature = "acp",
 ))]
 mod unified_adapter;
 use openab_core::acp;
@@ -35,6 +36,9 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::{error, info, warn};
+
+#[cfg(feature = "feishu")]
+const FEISHU_IDENTITY_RESOLUTION_TIMEOUT_SECS: u64 = 15;
 
 /// Wait for SIGINT (ctrl_c) or, on unix, SIGTERM.
 async fn shutdown_signal() {
@@ -113,6 +117,46 @@ enum Commands {
         #[arg(long)]
         thread: Option<String>,
     },
+    /// MCP add-on operations (OAB MCP Adapter ADR): interactive and
+    /// operational actions for MCP components. Long-running serving is
+    /// config-driven (`[mcp]` in config.toml + `openab run`); these
+    /// subcommands cover interactive logins and standalone/dev serving.
+    Mcp {
+        #[command(subcommand)]
+        addon: McpAddon,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum McpAddon {
+    /// Native Gmail adapter (Capability Plugin, ADR §6.1/§6.5): the six-tool
+    /// read+drafts Gmail profile served from Gmail's GA REST API as a
+    /// loopback Streamable HTTP MCP server. Register it in mcp.json as a
+    /// `"type": "http"` entry pointing at http://<listen>/mcp.
+    GmailNative {
+        #[command(subcommand)]
+        action: GmailNativeAction,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum GmailNativeAction {
+    /// Serve the adapter over loopback Streamable HTTP (non-loopback
+    /// addresses are refused — same trust model as the OAB MCP Facade).
+    /// Requires GMAIL_OAUTH_CLIENT_ID (+ optional GMAIL_OAUTH_CLIENT_SECRET)
+    /// in the environment for token refresh.
+    Serve {
+        /// Loopback address to listen on.
+        #[arg(long, default_value = "127.0.0.1:8850")]
+        listen: String,
+    },
+    /// Google OAuth paste-back login requesting offline access, so a refresh
+    /// token is stored and headless deployments survive token expiry.
+    Login {
+        /// Redirect URI pre-registered on the OAuth client.
+        #[arg(long, default_value = openab_mcp::native::gmail::DEFAULT_REDIRECT_URI)]
+        redirect_uri: String,
+    },
 }
 
 /// Returns true if any unified platform is enabled and its corresponding
@@ -136,6 +180,13 @@ fn has_unified_platform(cfg: &config::Config) -> bool {
                 .unwrap_or_default()
                 .resolve()
                 .enabled)
+        // ACP is a first-class embedded endpoint: an ACP-only deploy (no discord/slack/
+        // gateway/telegram) must not trip the "no adapter configured" preflight bail and
+        // must start the embedded HTTP server that hosts /acp.
+        || (cfg!(feature = "acp")
+            && std::env::var("OPENAB_ACP_ENABLED")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false))
 }
 
 /// Returns true when the first-class `[wecom]` section resolves all credentials
@@ -290,6 +341,24 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        Commands::Mcp { addon } => {
+            let McpAddon::GmailNative { action } = addon;
+            match action {
+                GmailNativeAction::Serve { listen } => {
+                    if let Err(e) = openab_mcp::native::gmail::serve_http(&listen).await {
+                        eprintln!("gmail-native: {e:#}");
+                        std::process::exit(1);
+                    }
+                }
+                GmailNativeAction::Login { redirect_uri } => {
+                    if let Err(e) = openab_mcp::native::gmail::login(&redirect_uri).await {
+                        eprintln!("gmail-native login: {e:#}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            return Ok(());
+        }
         Commands::Run { config } => config,
     };
 
@@ -315,8 +384,25 @@ async fn main() -> anyhow::Result<()> {
         && cfg.telegram.is_none()
         && !has_unified_platform(&cfg)
     {
+        // Facade-only run mode (#1451): an adapter-less config with `[mcp]`
+        // present is a valid deployment — the broker serves just the OAB MCP
+        // Facade listener. One entrypoint, config-driven: hosts that only
+        // need the capability surface (coding-CLI-only users, dev loops, CI
+        // runners, agent hosts with no chat platform) run the same
+        // `openab run` with a two-line config instead of a chat token.
+        if let Some(mcp_cfg) = cfg.mcp.clone() {
+            tracing::info!(
+                listen = %mcp_cfg.listen,
+                "no chat adapter configured — running in facade-only mode ([mcp] present)"
+            );
+            // Foreground, not spawned: the facade IS the workload. A bind
+            // failure or server exit terminates the process (fail fast).
+            return openab_mcp::mcp::facade::serve_http(&mcp_cfg.listen)
+                .await
+                .map_err(|e| anyhow::anyhow!("OAB MCP facade exited: {e:#}"));
+        }
         anyhow::bail!(
-            "no adapter configured — add [discord], [slack], [telegram], [wecom], [googlechat], or [gateway] to config, or set platform env vars (TELEGRAM_BOT_TOKEN, etc.)"
+            "no adapter configured — add [discord], [slack], [telegram], [wecom], [googlechat], or [gateway] to config (or [mcp] for facade-only mode), or set platform env vars (TELEGRAM_BOT_TOKEN, etc.)"
         );
     }
 
@@ -360,10 +446,27 @@ async fn main() -> anyhow::Result<()> {
         feature = "googlechat",
         feature = "wecom",
         feature = "teams",
+        feature = "acp",
     ))]
     let unified_platform_enabled = has_unified_platform(&cfg);
 
     let shutdown_hook = cfg.hooks.pre_shutdown.clone();
+
+    // OAB MCP Facade (`[mcp]` in config.toml — OAB MCP Adapter ADR §6.2):
+    // serve the loopback Streamable HTTP MCP server in-process so any coding
+    // CLI on this host can reach authorized external capabilities via
+    // http://<listen>/mcp. Absent section = no listener (backward compat).
+    // A bind failure is fatal at startup (fail fast, like a bad platform
+    // token) rather than a silently missing capability surface.
+    if let Some(mcp_cfg) = cfg.mcp.clone() {
+        let listen = mcp_cfg.listen.clone();
+        tokio::spawn(async move {
+            if let Err(e) = openab_mcp::mcp::facade::serve_http(&listen).await {
+                tracing::error!(error = %format!("{e:#}"), listen, "OAB MCP facade exited");
+                std::process::exit(1);
+            }
+        });
+    }
 
     let pool = Arc::new(acp::SessionPool::new(
         cfg.agent,
@@ -419,7 +522,7 @@ async fn main() -> anyhow::Result<()> {
         let allow_all_users = env_bool("GATEWAY_ALLOW_ALL_USERS", false);
         let allowed_users = env_set("GATEWAY_ALLOWED_USERS");
         let mut reg = PlatformTrustConfigs::new();
-        for platform in ["telegram", "line", "feishu", "wecom", "googlechat", "teams"] {
+        for platform in ["telegram", "line", "feishu", "wecom", "googlechat", "teams", "acp"] {
             reg.insert(
                 platform,
                 TrustConfig::new(
@@ -899,6 +1002,11 @@ async fn main() -> anyhow::Result<()> {
     // Spawn embedded webhook server when gateway adapters are compiled in (unified mode).
     // In unified mode, platform webhooks hit this axum server directly → Dispatcher.submit(),
     // bypassing the WebSocket hop of the two-process model.
+    #[cfg(feature = "feishu")]
+    let mut unified_feishu_shutdown: Option<tokio::sync::watch::Sender<bool>> = None;
+    #[cfg(feature = "feishu")]
+    let mut unified_feishu_handle: Option<tokio::task::JoinHandle<()>> = None;
+
     #[cfg(any(
         feature = "telegram",
         feature = "line",
@@ -906,11 +1014,19 @@ async fn main() -> anyhow::Result<()> {
         feature = "googlechat",
         feature = "wecom",
         feature = "teams",
+        feature = "acp",
     ))]
     let (_unified_handle, shared_unified_adapter) = {
         use openab_core::gateway::{process_gateway_event, GatewayEventContext};
 
-        if unified_platform_enabled || cfg.telegram.is_some() {
+        // The ACP endpoint (mounted below) needs this embedded HTTP server too —
+        // start it even when only non-webhook platforms (e.g. Discord, which the
+        // core connects to directly) are configured.
+        let acp_enabled = cfg!(feature = "acp")
+            && std::env::var("OPENAB_ACP_ENABLED")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false);
+        if unified_platform_enabled || cfg.telegram.is_some() || acp_enabled {
             let listen_addr =
                 std::env::var("GATEWAY_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into());
 
@@ -1063,12 +1179,12 @@ async fn main() -> anyhow::Result<()> {
             if gw_state.feishu.is_some() {
                 // NOTE (#1356 L1 audit): unlike the standalone gateway (which
                 // mounts this route only in Webhook connection mode), the
-                // unified binary mounts it unconditionally — and never spawns
-                // the Websocket client. Deployments relying on Feishu-side
-                // webhook delivery while FEISHU_CONNECTION_MODE is unset
-                // (default: websocket) work only because of this mount, so
-                // gating it is a behavior change that needs its own
-                // deprecation path — tracked on #1356, not changed here.
+                // unified binary mounts it unconditionally. In WebSocket mode,
+                // the client is also started below. Deployments relying on
+                // Feishu-side webhook delivery while FEISHU_CONNECTION_MODE is
+                // unset (default: websocket) work because this route remains
+                // mounted, so gating it is a behavior change that needs its
+                // own deprecation path — tracked on #1356, not changed here.
                 let path = gw_state
                     .feishu
                     .as_ref()
@@ -1079,6 +1195,47 @@ async fn main() -> anyhow::Result<()> {
                     &path,
                     axum::routing::post(openab_gateway::adapters::feishu::webhook),
                 );
+            }
+
+            // Feishu bot identity + WebSocket long-connection (unified mode).
+            // This mirrors the standalone gateway: the default websocket mode
+            // otherwise mounts only the webhook route and receives no events.
+            #[cfg(feature = "feishu")]
+            if let Some(ref f) = gw_state.feishu {
+                use openab_gateway::adapters::feishu;
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(FEISHU_IDENTITY_RESOLUTION_TIMEOUT_SECS),
+                    f.resolve_bot_identity(),
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(_) => warn!(
+                        "unified: feishu bot identity resolution timed out; continuing without bot identity"
+                    ),
+                }
+                if f.config.streaming_mode != feishu::StreamingMode::Post {
+                    let idle_ms = f.config.card_idle_finalize_ms;
+                    tokio::spawn(feishu::run_idle_reaper(
+                        f.stream_sessions.clone(),
+                        f.token_cache.clone(),
+                        f.client.clone(),
+                        f.config.api_base(),
+                        idle_ms,
+                    ));
+                    info!(idle_ms, "unified: feishu card-streaming idle reaper started");
+                }
+                if f.config.connection_mode == feishu::ConnectionMode::Websocket {
+                    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+                    match feishu::start_websocket(f, event_tx.clone(), shutdown_rx).await {
+                        Ok(handle) => {
+                            info!("unified: feishu websocket task spawned");
+                            unified_feishu_shutdown = Some(shutdown_tx);
+                            unified_feishu_handle = Some(handle);
+                        }
+                        Err(e) => error!(err = %e, "unified: feishu websocket startup failed"),
+                    }
+                }
             }
 
             #[cfg(feature = "wecom")]
@@ -1111,6 +1268,31 @@ async fn main() -> anyhow::Result<()> {
                     &gw_state.googlechat_webhook_path,
                     axum::routing::post(openab_gateway::adapters::googlechat::webhook),
                 );
+            }
+
+            // ACP server endpoint — mount on the embedded gateway so `openab run`
+            // (not just the standalone gateway binary) serves ACP over WebSocket.
+            #[cfg(feature = "acp")]
+            if std::env::var("OPENAB_ACP_ENABLED")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false)
+            {
+                // Fail-open (no transport key) is only allowed on a loopback bind; a
+                // non-loopback bind without OPENAB_ACP_AUTH_KEY refuses to mount /acp.
+                let acp_key = std::env::var("OPENAB_ACP_AUTH_KEY").ok();
+                match openab_gateway::adapters::acp_server::acp_auth_ok_for_bind(
+                    acp_key.as_deref(),
+                    &listen_addr,
+                ) {
+                    Ok(()) => {
+                        info!("unified: ACP server endpoint enabled at /acp");
+                        app = app.route(
+                            "/acp",
+                            axum::routing::get(openab_gateway::adapters::acp_server::ws_upgrade),
+                        );
+                    }
+                    Err(e) => error!("unified: ACP endpoint NOT mounted: {e}"),
+                }
             }
 
             let app = app.with_state(gw_state.clone());
@@ -1405,6 +1587,15 @@ async fn main() -> anyhow::Result<()> {
         let _ = std::fs::remove_file(ctl::socket_path());
     }
     let _ = shutdown_tx.send(true);
+    #[cfg(feature = "feishu")]
+    {
+        if let Some(feishu_shutdown_tx) = unified_feishu_shutdown.take() {
+            let _ = feishu_shutdown_tx.send(true);
+        }
+        if let Some(feishu_handle) = unified_feishu_handle.take() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), feishu_handle).await;
+        }
+    }
     if let Some(handle) = slack_handle {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
     }
