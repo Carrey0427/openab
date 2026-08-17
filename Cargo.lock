@@ -2550,6 +2550,7 @@ dependencies = [
  "rand 0.8.6",
  "regex",
  "reqwest 0.12.28",
+ "rmcp",
  "rpassword",
  "rustls 0.22.4",
  "serde",
@@ -2561,6 +2562,7 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.25.0",
  "tokio-tungstenite 0.21.0",
+ "tokio-util",
  "toml",
  "toml_edit",
  "tracing",
@@ -2571,6 +2573,26 @@ dependencies = [
  "uuid",
  "webpki-roots 0.26.11",
  "zip",
+]
+
+[[package]]
+name = "openab-cp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "clap",
+ "futures-util",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tokio",
+ "tokio-tungstenite 0.29.0",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2614,6 +2636,7 @@ dependencies = [
  "axum",
  "base64",
  "getrandom 0.4.3",
+ "http-body-util",
  "jsonschema",
  "libc",
  "oauth2",
@@ -2627,6 +2650,7 @@ dependencies = [
  "temp-env",
  "tempfile",
  "tokio",
+ "tower",
  "tracing",
  "url",
  "urlencoding",
